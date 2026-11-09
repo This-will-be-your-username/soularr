@@ -215,7 +215,9 @@ maximum_peer_queue = 50
 # Minimum upload speed (bits/sec)
 minimum_peer_upload_speed = 0
 # Minimum match ratio between Lidarr track and Soulseek filename
-minimum_filename_match_ratio = 0.8
+minimum_filename_match_ratio = 0.6
+# Allow folders with up to this many more audio files than the release has tracks (bonus tracks, editions)
+extra_tracks_allowed = 3
 # Minimum time (seconds) between searches. Set to 0 to disable.
 minimum_search_interval = 5
 # Wait this many hours before searching again for an album that wasn't found or failed to download.

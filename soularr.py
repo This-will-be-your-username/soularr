@@ -8,6 +8,7 @@ import sys
 import time
 import shutil
 import difflib
+import unicodedata
 import operator
 import configparser
 import logging
@@ -72,6 +73,7 @@ extensions_whitelist = []
 rename_download_folders = None
 search_sources = []
 minimum_match_ratio = None
+extra_tracks_allowed = 0
 minimum_search_interval = None
 search_retry_wait_hours = None
 search_attempts_file_path = None
@@ -104,63 +106,69 @@ broken_user = []
 failed_users = {}
 
 
+def _normalize(text):
+    """Lowercase, fold accents, and reduce everything but letters/digits to single spaces."""
+    text = re.sub(r"(?<=\w)['’`´](?=\w)", "", text)  # don't -> dont
+    text = unicodedata.normalize("NFKD", text.casefold().replace("&", " and "))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return " ".join(re.sub(r"[\W_]+", " ", text).split())
+
+
+def _title_variants(title):
+    """The title as-is, plus versions with bracketed parts and 'feat.' credits removed."""
+    variants = {_normalize(title)}
+    no_brackets = re.sub(r"[\(\[\{][^\)\]\}]*[\)\]\}]", " ", title)
+    variants.add(_normalize(no_brackets))
+    variants.add(_normalize(re.split(r"\s+(?:feat\.?|ft\.?|featuring|with)\s+", no_brackets, flags=re.IGNORECASE)[0]))
+    return {v for v in variants if v}
+
+
+def _file_variants(path):
+    """The slskd filename with directory and extension removed, with and without a leading track number."""
+    base = re.split(r"[\/]", path)[-1]
+    base = base.rpartition(".")[0] or base
+    stripped = re.sub(r"^\s*(?:(?:cd|disc|disk)?\s*\d{1,2}\s*[-.]\s*)?\d{1,3}\s*[-._)\]]*\s*", "", base, flags=re.IGNORECASE)
+    return {v for v in (_normalize(base), _normalize(stripped)) if v}
+
+
+def track_score(lidarr_title, slskd_filename):
+    """Similarity (0-1) between a Lidarr track title and a slskd filename, tolerant of numbering, case, punctuation and extra tags."""
+    best = 0.0
+    files = _file_variants(slskd_filename)
+    for title in _title_variants(lidarr_title):
+        for f in files:
+            best = max(best, difflib.SequenceMatcher(None, title, f).ratio())
+            if len(title) >= 3 and f" {title} " in f" {f} ":
+                best = max(best, 0.85 + 0.15 * len(title) / len(f))
+    return best
+
+
 def album_match(lidarr_tracks, slskd_tracks, username, filetype):
-    counted = []
-    total_match = 0.0
+    # Score every Lidarr track against every file, then assign one file per track (best scores first)
+    scores = []
+    for i, lidarr_track in enumerate(lidarr_tracks):
+        for j, slskd_track in enumerate(slskd_tracks):
+            score = track_score(lidarr_track["title"], slskd_track["filename"])
+            if score >= minimum_match_ratio:
+                scores.append((score, i, j))
+    scores.sort(reverse=True)
 
-    lidarr_album = lidarr.get_album(lidarr_tracks[0]["albumId"])
-    lidarr_album_name = lidarr_album["title"]
-    lidarr_artist_name = lidarr_album["artist"]["artistName"]
+    used_tracks, used_files, total_match = set(), set(), 0.0
+    for score, i, j in scores:
+        if i in used_tracks or j in used_files:
+            continue
+        used_tracks.add(i)
+        used_files.add(j)
+        total_match += score
 
-    for lidarr_track in lidarr_tracks:
-        lidarr_filename = lidarr_track["title"] + "." + filetype.split(" ")[0]
-        best_match = 0.0
-
-        for slskd_track in slskd_tracks:
-            name, dot, extension = slskd_track["filename"].rpartition(".")
-            slskd_filename = f"{name}.{extension.lower()}" if dot else slskd_track["filename"]
-
-            # Try to match the ratio with the exact filenames
-            ratio = difflib.SequenceMatcher(None, lidarr_filename, slskd_filename).ratio()
-
-            # If ratio is a bad match try and split off (with " " as the separator) the garbage at the start of the slskd_filename and try again
-            ratio = check_ratio(" ", ratio, lidarr_filename, slskd_filename)
-            # Same but with "_" as the separator
-            ratio = check_ratio("_", ratio, lidarr_filename, slskd_filename)
-
-            # Same checks but preappend album name.
-            ratio = check_ratio("", ratio, lidarr_album_name + " " + lidarr_filename, slskd_filename)
-            ratio = check_ratio(" ", ratio, lidarr_album_name + " " + lidarr_filename, slskd_filename)
-            ratio = check_ratio("_", ratio, lidarr_album_name + " " + lidarr_filename, slskd_filename)
-
-            if ratio > best_match:
-                best_match = ratio
-
-        if best_match > minimum_match_ratio:
-            counted.append(lidarr_filename)
-            total_match += best_match
-
-    if len(counted) == len(lidarr_tracks) and username not in ignored_users:
-        logger.info(f"Found match from user: {username} for {len(counted)} tracks! Track attributes: {filetype}")
-        logger.info(f"Average sequence match ratio: {total_match / len(counted)}")
+    if len(used_tracks) == len(lidarr_tracks) and username not in ignored_users:
+        logger.info(f"Found match from user: {username} for {len(used_tracks)} tracks! Track attributes: {filetype}")
+        logger.info(f"Average sequence match ratio: {total_match / len(used_tracks)}")
         logger.info("SUCCESSFUL MATCH")
         logger.info("-------------------")
         return True
 
     return False
-
-
-def check_ratio(separator, ratio, lidarr_filename, slskd_filename):
-    if ratio < minimum_match_ratio:
-        if separator != "":
-            lidarr_filename_word_count = len(lidarr_filename.split()) * -1
-            truncated_slskd_filename = " ".join(slskd_filename.split(separator)[lidarr_filename_word_count:])
-            ratio = difflib.SequenceMatcher(None, lidarr_filename, truncated_slskd_filename).ratio()
-        else:
-            ratio = difflib.SequenceMatcher(None, lidarr_filename, slskd_filename).ratio()
-
-        return ratio
-    return ratio
 
 
 def album_track_num(directory):
@@ -402,7 +410,7 @@ def check_for_match(tracks, allowed_filetype, file_dirs, username):
         track_num = len(tracks)
         tracks_info = album_track_num(directory)
 
-        if tracks_info["count"] == track_num and tracks_info["filetype"] != "":
+        if track_num <= tracks_info["count"] <= track_num + extra_tracks_allowed and tracks_info["filetype"] != "":
             if album_match(tracks, directory["files"], username, allowed_filetype):
                 return True, directory, file_dir
             else:
@@ -1468,6 +1476,7 @@ def main():
         rename_download_folders, \
         search_sources, \
         minimum_match_ratio, \
+        extra_tracks_allowed, \
         minimum_search_interval, \
         search_retry_wait_hours, \
         search_attempts_file_path, \
@@ -1605,7 +1614,8 @@ def main():
         if search_sources[0] == "all":
             search_sources = ["missing", "cutoff_unmet"]
 
-        minimum_match_ratio = config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.5)
+        minimum_match_ratio = config.getfloat("Search Settings", "minimum_filename_match_ratio", fallback=0.6)
+        extra_tracks_allowed = config.getint("Search Settings", "extra_tracks_allowed", fallback=3)
         minimum_search_interval = config.getint("Search Settings", "minimum_search_interval", fallback=5)
         search_retry_wait_hours = config.getfloat("Search Settings", "search_retry_wait_hours", fallback=0)
         page_size = config.getint("Search Settings", "number_of_albums_to_grab", fallback=10)
